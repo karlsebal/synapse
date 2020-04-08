@@ -42,7 +42,7 @@ from synapse.handlers.presence import PresenceHandler, get_interested_parties
 from synapse.http.server import JsonResource
 from synapse.http.servlet import RestServlet, parse_json_object_from_request
 from synapse.http.site import SynapseSite
-from synapse.logging.context import LoggingContext, run_in_background
+from synapse.logging.context import LoggingContext
 from synapse.metrics import METRICS_PREFIX, MetricsResource, RegistryProxy
 from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.replication.slave.storage._base import BaseSlavedStore, __func__
@@ -64,7 +64,7 @@ from synapse.replication.slave.storage.receipts import SlavedReceiptsStore
 from synapse.replication.slave.storage.registration import SlavedRegistrationStore
 from synapse.replication.slave.storage.room import RoomStore
 from synapse.replication.slave.storage.transactions import SlavedTransactionStore
-from synapse.replication.tcp.client import ReplicationClientHandler
+from synapse.replication.tcp.client import ReplicationDataHandler
 from synapse.replication.tcp.commands import ClearUserSyncsCommand
 from synapse.replication.tcp.streams import (
     AccountDataStream,
@@ -603,7 +603,7 @@ class GenericWorkerServer(HomeServer):
     def remove_pusher(self, app_id, push_key, user_id):
         self.get_tcp_replication().send_remove_pusher(app_id, push_key, user_id)
 
-    def build_tcp_replication(self):
+    def build_replication_data_handler(self):
         return GenericWorkerReplicationHandler(self)
 
     def build_presence_handler(self):
@@ -613,7 +613,7 @@ class GenericWorkerServer(HomeServer):
         return GenericWorkerTyping(self)
 
 
-class GenericWorkerReplicationHandler(ReplicationClientHandler):
+class GenericWorkerReplicationHandler(ReplicationDataHandler):
     def __init__(self, hs):
         super(GenericWorkerReplicationHandler, self).__init__(hs.get_datastore())
 
@@ -635,7 +635,7 @@ class GenericWorkerReplicationHandler(ReplicationClientHandler):
         await super(GenericWorkerReplicationHandler, self).on_rdata(
             stream_name, token, rows
         )
-        run_in_background(self.process_and_notify, stream_name, token, rows)
+        await self.process_and_notify(stream_name, token, rows)
 
     def get_streams_to_replicate(self):
         args = super(GenericWorkerReplicationHandler, self).get_streams_to_replicate()
@@ -644,13 +644,12 @@ class GenericWorkerReplicationHandler(ReplicationClientHandler):
             args.update(self.send_handler.stream_positions())
         return args
 
-    def get_currently_syncing_users(self):
-        return self.presence_handler.get_currently_syncing_users()
-
     async def process_and_notify(self, stream_name, token, rows):
         try:
             if self.send_handler:
-                self.send_handler.process_replication_rows(stream_name, token, rows)
+                await self.send_handler.process_replication_rows(
+                    stream_name, token, rows
+                )
 
             if stream_name == EventsStream.NAME:
                 # We shouldn't get multiple rows per token for events stream, so
@@ -782,12 +781,12 @@ class FederationSenderHandler(object):
     def stream_positions(self):
         return {"federation": self.federation_position}
 
-    def process_replication_rows(self, stream_name, token, rows):
+    async def process_replication_rows(self, stream_name, token, rows):
         # The federation stream contains things that we want to send out, e.g.
         # presence, typing, etc.
         if stream_name == "federation":
             send_queue.process_rows_for_federation(self.federation_sender, rows)
-            run_in_background(self.update_token, token)
+            await self.update_token(token)
 
         # We also need to poke the federation sender when new events happen
         elif stream_name == "events":
@@ -795,9 +794,7 @@ class FederationSenderHandler(object):
 
         # ... and when new receipts happen
         elif stream_name == ReceiptsStream.NAME:
-            run_as_background_process(
-                "process_receipts_for_federation", self._on_new_receipts, rows
-            )
+            await self._on_new_receipts(rows)
 
         # ... as well as device updates and messages
         elif stream_name == DeviceListsStream.NAME:
